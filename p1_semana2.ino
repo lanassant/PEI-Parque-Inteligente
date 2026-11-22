@@ -274,6 +274,7 @@ bool processarEntrada(unsigned long agora) {
       break;
 
     case FECHAR:
+      // se voltar a haver algo na zona, reabrir em vez de continuar a fechar
       if (ivEntradaAtivo || (!contouEntrada && (!sonarValido || presente))) {
         estadoEntrada = ABERTA;
         tempoInicioEntrada = agora;
@@ -369,21 +370,28 @@ void atualizarSaidasHardware(unsigned long agora) {
     }
     escreverServo(SERVO_SAIDA, pulso);
   }
+
+  // Vermelho - falha de leitura/recusa/falha do servo da entrada
   bool alturaInvalida = sonarValido && presente && (altura > ALTURA_MAX_CM);
   bool aviso = !sonarValido || alturaInvalida || (estadoEntrada == RECUSADA) || !entradaAutorizada() || !servoEntradaOK;
   digitalWrite(LED_VERDE, aviso ? LOW : HIGH);
   digitalWrite(LED_VERMELHO, aviso ? HIGH : LOW);
 
+  // Dois apitos apenas por altura excessiva, com lugares disponiveis.
+  // Parque cheio, falta de eco e outras recusas nao provocam som.
   if (buzzerOK) {
-    static bool avisoAnterior = false;
+    static bool alturaJaAvisada = false;
     static bool sequenciaAtiva = false;
     static unsigned long inicioApitos = 0;
 
-    if (aviso && !avisoAnterior && !sequenciaAtiva) {
+    if (sonarValido && !presente) alturaJaAvisada = false;
+    bool avisoAltura = alturaInvalida && entradaAutorizada();
+    if (!avisoAltura) sequenciaAtiva = false;
+    if (avisoAltura && !alturaJaAvisada) {
       inicioApitos = agora;
       sequenciaAtiva = true;
+      alturaJaAvisada = true;
     }
-    avisoAnterior = aviso;
 
     unsigned long decorrido = agora - inicioApitos;
     bool som = false;
@@ -435,6 +443,7 @@ void imprimirDiagnostico(unsigned long agora) {
 // 9. Setup e loop
 // =====================================================
 void iniciarLCD() {
+  // Os pinos do UNO (A4/A5) do exemplo do fabricante nao se aplicam ao ESP32-C6.
   Wire.setPins(LCD_SDA, LCD_SCL);
   if (!Wire.begin()) {
     Serial.println("[LCD] Falha ao iniciar I2C. As cancelas continuam a funcionar.");
@@ -447,9 +456,9 @@ void iniciarLCD() {
     Serial.println("[LCD] Sem resposta em 0x27. Verificar ligacoes/endereco com scanner_i2c.");
     return;
   }
-  lcd.init(); // substitui lcd.begin(16, 2)
+  lcd.init(); // substitui lcd.begin(16, 2) do LCD paralelo do Lab 6
   lcd.backlight();
-  // caracteres: ordinal masculino e a com til
+  // Caracteres proprios: ordinal masculino e a com til (o LCD nao le UTF-8).
   byte ordinal[8] = {6, 9, 9, 6, 0, 15, 0, 0};
   byte aComTil[8] = {13, 18, 0, 14, 1, 15, 17, 15};
   lcd.createChar(1, ordinal);
