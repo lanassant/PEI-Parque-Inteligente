@@ -17,8 +17,10 @@
 
 // KS0061: LCD de 16 colunas e 2 linhas, interface I2C.
 const int ENDERECO_LCD = 0x27;
+const unsigned long INTERVALO_LCD_MS = 300;
 LiquidCrystal_I2C lcd(ENDERECO_LCD, 16, 2);
 bool lcdOK = false;
+unsigned long ultimoLCD = 0;
 
 const int CAPACIDADE = 5;
 const int OCUPACAO_INICIAL = 0; // arrancar com o parque vazio; ajustar se houver carros
@@ -190,7 +192,7 @@ bool entradaAutorizada() {
 }
 
 // =====================================================
-// Contagem e LCD
+// Contagem e LCD - adaptacao do Lab 6 para I2C
 // =====================================================
 void atualizarContagem(bool entrou, bool saiu) {
   ocupados = ocupados + (entrou ? 1 : 0) - (saiu ? 1 : 0);
@@ -223,10 +225,13 @@ void iniciarLCD() {
 }
 
 void atualizarLCD(unsigned long agora, bool antesDeAbrir = false) {
-  if (!lcdOK) return;
-  bool entradaEmMovimento = (estadoEntrada == ABERTA || estadoEntrada == FECHAR) && !tempoDecorreu(agora, tempoInicioEntrada, TEMPO_SERVO_MS);
-  bool saidaEmMovimento = (estadoSaida == ABERTA || estadoSaida == FECHAR) && !tempoDecorreu(agora, tempoInicioSaida, TEMPO_SERVO_MS);
+  if (!lcdOK || (!antesDeAbrir && !tempoDecorreu(agora, ultimoLCD, INTERVALO_LCD_MS))) return;
+  bool entradaEmMovimento = (estadoEntrada == ABERTA || estadoEntrada == FECHAR) &&
+                            !tempoDecorreu(agora, tempoInicioEntrada, TEMPO_SERVO_MS);
+  bool saidaEmMovimento = (estadoSaida == ABERTA || estadoSaida == FECHAR) &&
+                          !tempoDecorreu(agora, tempoInicioSaida, TEMPO_SERVO_MS);
   if ((!antesDeAbrir && entradaEmMovimento) || saidaEmMovimento) return;
+  ultimoLCD = agora;
 
   Wire.beginTransmission(ENDERECO_LCD);
   if (Wire.endTransmission() != 0) {
@@ -254,10 +259,17 @@ void atualizarLCD(unsigned long agora, bool antesDeAbrir = false) {
   while (linha2.length() < 16) linha2 += " ";
   linha1 = linha1.substring(0, 16);
   linha2 = linha2.substring(0, 16);
-  lcd.setCursor(0, 0);
-  lcd.print(linha1);
-  lcd.setCursor(0, 1);
-  lcd.print(linha2);
+  static String ultimaLinha1 = "", ultimaLinha2 = "";
+  if (linha1 != ultimaLinha1) {
+    lcd.setCursor(0, 0);
+    lcd.print(linha1);
+    ultimaLinha1 = linha1;
+  }
+  if (linha2 != ultimaLinha2) {
+    lcd.setCursor(0, 1);
+    lcd.print(linha2);
+    ultimaLinha2 = linha2;
+  }
 }
 
 bool viaLivreDurante(bool condicaoLivre, unsigned long agora, unsigned long tempoAlvo, bool &aContar, unsigned long &desde) {
@@ -444,12 +456,11 @@ void atualizarSaidasHardware(unsigned long agora) {
     escreverServo(SERVO_SAIDA, pulso);
   }
 
-  // Vermelho - falha de leitura/recusa/falha do servo da entrada
   bool alturaInvalida = sonarValido && presente && (altura > ALTURA_MAX_CM);
   bool aviso = !sonarValido || alturaInvalida || (estadoEntrada == RECUSADA) || !entradaAutorizada() || !servoEntradaOK;
   digitalWrite(LED_VERDE, aviso ? LOW : HIGH);
   digitalWrite(LED_VERMELHO, aviso ? HIGH : LOW);
-  
+
   if (buzzerOK) {
     static bool alturaJaAvisada = false;
     static bool sequenciaAtiva = false;
@@ -579,3 +590,4 @@ void loop() {
   imprimirDiagnostico(agora);
   atualizarLCD(millis());
 }
+
