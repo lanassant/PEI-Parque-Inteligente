@@ -1,13 +1,6 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-
-#define LCD_SDA 6
-#define LCD_SCL 7
-const int ENDERECO_LCD = 0x27;
-LiquidCrystal_I2C lcd(ENDERECO_LCD, 16, 2);
-bool lcdOK = false;
-
 // =====================================================
 // Configuração
 // =====================================================
@@ -19,6 +12,17 @@ bool lcdOK = false;
 #define LED_VERDE 22
 #define LED_VERMELHO 23
 #define BUZZER 14
+#define LCD_SDA 6
+#define LCD_SCL 7
+
+// KS0061: LCD de 16 colunas e 2 linhas, interface I2C.
+const int ENDERECO_LCD = 0x27;
+LiquidCrystal_I2C lcd(ENDERECO_LCD, 16, 2);
+bool lcdOK = false;
+
+const int CAPACIDADE = 5;
+const int OCUPACAO_INICIAL = 0; // arrancar com o parque vazio; ajustar se houver carros
+int ocupados = OCUPACAO_INICIAL;
 
 const int NIVEL_IV_ATIVO = LOW;
 
@@ -182,9 +186,78 @@ void escreverServo(int pino, int pulsoUs) {
 }
 
 bool entradaAutorizada() {
-  // contagem de lugares
-  // autorização provisoriamente ativa;
-  return true;
+  return ocupados < CAPACIDADE;
+}
+
+// =====================================================
+// Contagem e LCD
+// =====================================================
+void atualizarContagem(bool entrou, bool saiu) {
+  ocupados = ocupados + (entrou ? 1 : 0) - (saiu ? 1 : 0);
+  if (ocupados < 0) ocupados = 0;
+  if (ocupados > CAPACIDADE) ocupados = CAPACIDADE;
+}
+
+void iniciarLCD() {
+  Wire.setPins(LCD_SDA, LCD_SCL);
+  if (!Wire.begin()) {
+    Serial.println("[LCD] Falha ao iniciar I2C. As cancelas continuam a funcionar.");
+    return;
+  }
+  Wire.setClock(100000);
+  Wire.setTimeOut(10);
+  Wire.beginTransmission(ENDERECO_LCD);
+  if (Wire.endTransmission() != 0) {
+    Serial.println("[LCD] Sem resposta em 0x27. Verificar ligacoes/endereco com scanner_i2c.");
+    return;
+  }
+  lcd.init(); // substitui lcd.begin(16, 2)
+  lcd.backlight();
+  // caracteres: ordinal masculino e a com til
+  byte ordinal[8] = {6, 9, 9, 6, 0, 15, 0, 0};
+  byte aComTil[8] = {13, 18, 0, 14, 1, 15, 17, 15};
+  lcd.createChar(1, ordinal);
+  lcd.createChar(2, aComTil);
+  lcdOK = true;
+  Serial.println("[LCD] KS0061 encontrado. Contagem inicia com OCUPACAO_INICIAL.");
+}
+
+void atualizarLCD(unsigned long agora, bool antesDeAbrir = false) {
+  if (!lcdOK) return;
+  bool entradaEmMovimento = (estadoEntrada == ABERTA || estadoEntrada == FECHAR) && !tempoDecorreu(agora, tempoInicioEntrada, TEMPO_SERVO_MS);
+  bool saidaEmMovimento = (estadoSaida == ABERTA || estadoSaida == FECHAR) && !tempoDecorreu(agora, tempoInicioSaida, TEMPO_SERVO_MS);
+  if ((!antesDeAbrir && entradaEmMovimento) || saidaEmMovimento) return;
+
+  Wire.beginTransmission(ENDERECO_LCD);
+  if (Wire.endTransmission() != 0) {
+    lcdOK = false;
+    Serial.println("[LCD] Ligacao perdida; verificar a montagem e reiniciar.");
+    return;
+  }
+
+  String linha1 = "N\1 Lug. Ocupados";
+  String linha2 = String(ocupados) + "/" + String(CAPACIDADE);
+  if (ocupados >= CAPACIDADE) {
+    linha1 = "Parque cheio!";
+  } else if (sonarValido && presente && altura > ALTURA_MAX_CM) {
+    linha1 = "Altura n\2o";
+    linha2 = "permitida!";
+  } else if (!servoEntradaOK || !servoSaidaOK) {
+    linha1 = "Verificar servos";
+  } else if (estadoEntrada == RECUSADA) {
+    linha1 = "Entrada recusada";
+  } else if (sonarValido && estadoEntrada == ABERTA && !contouEntrada) {
+    linha1 = "Bem-vindo!";
+  }
+
+  while (linha1.length() < 16) linha1 += " ";
+  while (linha2.length() < 16) linha2 += " ";
+  linha1 = linha1.substring(0, 16);
+  linha2 = linha2.substring(0, 16);
+  lcd.setCursor(0, 0);
+  lcd.print(linha1);
+  lcd.setCursor(0, 1);
+  lcd.print(linha2);
 }
 
 bool viaLivreDurante(bool condicaoLivre, unsigned long agora, unsigned long tempoAlvo, bool &aContar, unsigned long &desde) {
@@ -274,6 +347,7 @@ bool processarEntrada(unsigned long agora) {
       break;
 
     case FECHAR:
+      // se voltar a haver algo na zona, reabrir em vez de continuar a fechar
       if (ivEntradaAtivo || (!contouEntrada && (!sonarValido || presente))) {
         estadoEntrada = ABERTA;
         tempoInicioEntrada = agora;
@@ -369,21 +443,26 @@ void atualizarSaidasHardware(unsigned long agora) {
     }
     escreverServo(SERVO_SAIDA, pulso);
   }
+
+  // Vermelho - falha de leitura/recusa/falha do servo da entrada
   bool alturaInvalida = sonarValido && presente && (altura > ALTURA_MAX_CM);
   bool aviso = !sonarValido || alturaInvalida || (estadoEntrada == RECUSADA) || !entradaAutorizada() || !servoEntradaOK;
   digitalWrite(LED_VERDE, aviso ? LOW : HIGH);
   digitalWrite(LED_VERMELHO, aviso ? HIGH : LOW);
-
+  
   if (buzzerOK) {
-    static bool avisoAnterior = false;
+    static bool alturaJaAvisada = false;
     static bool sequenciaAtiva = false;
     static unsigned long inicioApitos = 0;
 
-    if (aviso && !avisoAnterior && !sequenciaAtiva) {
+    if (sonarValido && !presente) alturaJaAvisada = false;
+    bool avisoAltura = alturaInvalida && entradaAutorizada();
+    if (!avisoAltura) sequenciaAtiva = false;
+    if (avisoAltura && !alturaJaAvisada) {
       inicioApitos = agora;
       sequenciaAtiva = true;
+      alturaJaAvisada = true;
     }
-    avisoAnterior = aviso;
 
     unsigned long decorrido = agora - inicioApitos;
     bool som = false;
@@ -428,36 +507,14 @@ void imprimirDiagnostico(unsigned long agora) {
   Serial.print(" | Entrada: ");
   Serial.print((int)estadoEntrada);
   Serial.print(" | Saida: ");
-  Serial.println((int)estadoSaida);
+  Serial.print((int)estadoSaida);
+  Serial.print(" | Ocupados: "); Serial.print(ocupados);
+  Serial.print(" | Livres: "); Serial.println(CAPACIDADE - ocupados);
 }
 
 // =====================================================
 // 9. Setup e loop
 // =====================================================
-void iniciarLCD() {
-  Wire.setPins(LCD_SDA, LCD_SCL);
-  if (!Wire.begin()) {
-    Serial.println("[LCD] Falha ao iniciar I2C. As cancelas continuam a funcionar.");
-    return;
-  }
-  Wire.setClock(100000);
-  Wire.setTimeOut(10);
-  Wire.beginTransmission(ENDERECO_LCD);
-  if (Wire.endTransmission() != 0) {
-    Serial.println("[LCD] Sem resposta em 0x27. Verificar ligacoes/endereco com scanner_i2c.");
-    return;
-  }
-  lcd.init(); // substitui lcd.begin(16, 2)
-  lcd.backlight();
-  // caracteres: ordinal masculino e a com til
-  byte ordinal[8] = {6, 9, 9, 6, 0, 15, 0, 0};
-  byte aComTil[8] = {13, 18, 0, 14, 1, 15, 17, 15};
-  lcd.createChar(1, ordinal);
-  lcd.createChar(2, aComTil);
-  lcdOK = true;
-  Serial.println("[LCD] KS0061 encontrado. LCD pronto.");
-}
-
 void setup() {
   Serial.begin(115200);
 
@@ -488,6 +545,8 @@ void setup() {
   Serial.println("Estados: 0=REARMAR, 1=FECHADA, 2=VALIDAR, 3=ABERTA, 4=FECHAR, 5=RECUSADA");
   Serial.print("Altura valida: "); Serial.print(ALTURA_MIN_DETECAO_CM);
   Serial.print(" a "); Serial.print(ALTURA_MAX_CM); Serial.println(" cm (inclusive)");
+  if (ocupados < 0) ocupados = 0;
+  if (ocupados > CAPACIDADE) ocupados = CAPACIDADE;
   iniciarLCD();
 }
 
@@ -501,13 +560,22 @@ void loop() {
 
   bool entrou = false;
   bool saiu = false;
+  Estado entradaAntes = estadoEntrada;
 
   if (servoEntradaOK) entrou = processarEntrada(agora);
   if (servoSaidaOK) saiu = processarSaida(agora);
 
   if (entrou) Serial.println("[EVENTO] Passagem de entrada confirmada pelo sensor IV.");
   if (saiu) Serial.println("[EVENTO] Passagem de saida confirmada pelo sensor IV.");
+  atualizarContagem(entrou, saiu);
 
+  // Mostrar a saudacao antes de iniciar o movimento, sem prolongar o pulso.
+  if (entradaAntes != ABERTA && estadoEntrada == ABERTA) {
+    atualizarLCD(millis(), true);
+    tempoInicioEntrada = millis();
+  }
+  agora = millis();
   atualizarSaidasHardware(agora);
   imprimirDiagnostico(agora);
+  atualizarLCD(millis());
 }
